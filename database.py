@@ -5,7 +5,6 @@ import psycopg
 
 from config import get_settings
 from subscriber_schema import SubscriberCreationData
-from utils import connect_db
 
 settings = get_settings()
 
@@ -14,8 +13,31 @@ if not logger.hasHandlers():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 
-def connect_brt_db() -> psycopg.Connection | None:
-    return connect_db(settings.brt_db_name, settings.get_brt_db_url())
+def connect_db(db_name, db_url) -> psycopg.Connection | None:
+    try:
+        conn = psycopg.connect(db_url, autocommit=False)
+        logger.info(
+            f"Успешное подключение к БД {db_name}"
+        )
+        return conn
+    except psycopg.OperationalError as e:
+        logger.error(f"Ошибка подключения к БД: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка при подключении к БД: {e}", exc_info=True)
+        return None
+
+
+def close_db(conn: psycopg.Connection | None):
+    if conn and not conn.closed:
+        try:
+            if conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+                conn.rollback()
+                logger.warning("Откат незавершенной транзакции при закрытии соединения.")
+            conn.close()
+            logger.info("Соединение с БД закрыто.")
+        except Exception as e:
+            logger.error(f"Ошибка при закрытии соединения с БД: {e}", exc_info=True)
 
 
 def get_sub_balance(
@@ -47,8 +69,24 @@ def get_sub_balance(
         return None
 
 
+def get_quant_service_balance(conn: psycopg.Connection, person_id: int, s_type_id: int = 0) -> int | None:
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT amount_left FROM quant_services WHERE p_id = %s AND s_type_id = %s;",
+                (person_id, s_type_id)
+            )
+            result = cur.fetchone()
+            if result:
+                return result[0]
+            else:
+                return 0
+    except Exception as e:
+        print(f"Ошибка при получении баланса quant_services для p_id {person_id}, s_type_id {s_type_id}: {e}")
+        return None
 
-def create_or_update_subscribers_with_related_data( # Функция переименована
+
+def create_or_update_subscribers_with_related_data(  # Функция переименована
         conn: psycopg.Connection,
         subscribers_to_process: list[SubscriberCreationData]
 ) -> dict[str, int]:
@@ -90,16 +128,22 @@ def create_or_update_subscribers_with_related_data( # Функция переи�
                     cur.execute(person_tariff_insert_query, (subscriber_data.tariff_id_logical, current_timestamp))
                     new_person_tariff_row = cur.fetchone()
                     if not new_person_tariff_row:
-                        logger.error(f"Не удалось создать запись в 'person_tariff' для обновления msisdn: {msisdn}. Транзакция будет отменена.")
+                        logger.error(
+                            f"Не удалось создать запись в 'person_tariff' для обновления msisdn: {msisdn}. Транзакция будет отменена.")
                         conn.rollback()
                         return {}
                     new_person_tariff_id = new_person_tariff_row['id']
-                    logger.debug(f"Новая запись 'person_tariff' (id: {new_person_tariff_id}) создана для msisdn: {msisdn} при обновлении.")
+                    logger.debug(
+                        f"Новая запись 'person_tariff' (id: {new_person_tariff_id}) создана для msisdn: {msisdn} при обновлении.")
 
                     final_name = f"{subscriber_data.name_prefix}{existing_person_id}"
                     person_update_query = """
                                           UPDATE person
-                                          SET money = %s, is_restricted = %s, description = %s, tariff_id = %s, name = %s
+                                          SET money         = %s,
+                                              is_restricted = %s,
+                                              description   = %s,
+                                              tariff_id     = %s,
+                                              name          = %s
                                           WHERE id = %s;
                                           """
                     person_update_values = (
@@ -112,11 +156,13 @@ def create_or_update_subscribers_with_related_data( # Функция переи�
                     )
                     cur.execute(person_update_query, person_update_values)
                     if cur.rowcount == 0:
-                        logger.warning(f"Обновление 'person' для ID {existing_person_id} (msisdn: {msisdn}) не затронуло ни одной строки. Это неожиданно.")
+                        logger.warning(
+                            f"Обновление 'person' для ID {existing_person_id} (msisdn: {msisdn}) не затронуло ни одной строки. Это неожиданно.")
                     logger.debug(f"Запись 'person' (id: {existing_person_id}) обновлена для msisdn: {msisdn}.")
 
                     qs_update_query = "UPDATE quant_services SET amount_left = %s WHERE p_id = %s AND s_type_id = %s;"
-                    cur.execute(qs_update_query, (subscriber_data.quant_amount_left, existing_person_id, subscriber_data.quant_s_type_id))
+                    cur.execute(qs_update_query, (subscriber_data.quant_amount_left, existing_person_id,
+                                                  subscriber_data.quant_s_type_id))
 
                     if cur.rowcount == 0:
                         qs_insert_query = """
@@ -124,15 +170,19 @@ def create_or_update_subscribers_with_related_data( # Функция переи�
                                           VALUES (%s, %s, %s)
                                           RETURNING id;
                                           """
-                        cur.execute(qs_insert_query, (existing_person_id, subscriber_data.quant_s_type_id, subscriber_data.quant_amount_left))
+                        cur.execute(qs_insert_query, (existing_person_id, subscriber_data.quant_s_type_id,
+                                                      subscriber_data.quant_amount_left))
                         inserted_quant_row = cur.fetchone()
                         if not inserted_quant_row:
-                            logger.error(f"Не удалось создать запись в 'quant_services' для person_id: {existing_person_id} (msisdn: {msisdn}) при обновлении. Транзакция будет отменена.")
+                            logger.error(
+                                f"Не удалось создать запись в 'quant_services' для person_id: {existing_person_id} (msisdn: {msisdn}) при обновлении. Транзакция будет отменена.")
                             conn.rollback()
                             return {}
-                        logger.debug(f"Запись 'quant_services' (id: {inserted_quant_row['id']}) создана для person_id: {existing_person_id} при обновлении.")
+                        logger.debug(
+                            f"Запись 'quant_services' (id: {inserted_quant_row['id']}) создана для person_id: {existing_person_id} при обновлении.")
                     else:
-                        logger.debug(f"Запись 'quant_services' обновлена для person_id: {existing_person_id} (msisdn: {msisdn}).")
+                        logger.debug(
+                            f"Запись 'quant_services' обновлена для person_id: {existing_person_id} (msisdn: {msisdn}).")
 
                     final_processed_ids_map[msisdn] = existing_person_id
                     logger.info(f"Успешно обновлен абонент {msisdn} (person.id: {existing_person_id}).")
@@ -148,7 +198,8 @@ def create_or_update_subscribers_with_related_data( # Функция переи�
                     cur.execute(person_tariff_insert_query, (subscriber_data.tariff_id_logical, current_timestamp))
                     inserted_person_tariff_row = cur.fetchone()
                     if not inserted_person_tariff_row:
-                        logger.error(f"Не удалось создать запись в 'person_tariff' для msisdn: {msisdn}. Транзакция будет отменена.")
+                        logger.error(
+                            f"Не удалось создать запись в 'person_tariff' для msisdn: {msisdn}. Транзакция будет отменена.")
                         conn.rollback()
                         return {}
                     new_person_tariff_id = inserted_person_tariff_row['id']
@@ -170,7 +221,8 @@ def create_or_update_subscribers_with_related_data( # Функция переи�
                     cur.execute(person_insert_query, person_insert_values)
                     inserted_person_row = cur.fetchone()
                     if not inserted_person_row:
-                        logger.error(f"Не удалось создать запись в 'person' для msisdn: {msisdn}. Транзакция будет отменена.")
+                        logger.error(
+                            f"Не удалось создать запись в 'person' для msisdn: {msisdn}. Транзакция будет отменена.")
                         conn.rollback()
                         return {}
                     new_person_id = inserted_person_row['id']
@@ -179,21 +231,26 @@ def create_or_update_subscribers_with_related_data( # Функция переи�
                     person_update_name_query = "UPDATE person SET name = %s WHERE id = %s;"
                     cur.execute(person_update_name_query, (final_name, new_person_id))
                     if cur.rowcount == 0:
-                        logger.warning(f"Обновление имени для только что созданного person.id {new_person_id} (msisdn: {msisdn}) не затронуло ни одной строки.")
-                    logger.debug(f"Абонент 'person' (id: {new_person_id}, msisdn: {msisdn}) создан, имя обновлено на '{final_name}'.")
+                        logger.warning(
+                            f"Обновление имени для только что созданного person.id {new_person_id} (msisdn: {msisdn}) не затронуло ни одной строки.")
+                    logger.debug(
+                        f"Абонент 'person' (id: {new_person_id}, msisdn: {msisdn}) создан, имя обновлено на '{final_name}'.")
 
                     quant_services_insert_query = """
                                                   INSERT INTO quant_services (p_id, s_type_id, amount_left)
                                                   VALUES (%s, %s, %s)
                                                   RETURNING id;
                                                   """
-                    cur.execute(quant_services_insert_query, (new_person_id, subscriber_data.quant_s_type_id, subscriber_data.quant_amount_left))
+                    cur.execute(quant_services_insert_query,
+                                (new_person_id, subscriber_data.quant_s_type_id, subscriber_data.quant_amount_left))
                     inserted_quant_row = cur.fetchone()
                     if not inserted_quant_row:
-                        logger.error(f"Не удалось создать запись в 'quant_services' для person_id: {new_person_id} (msisdn: {msisdn}). Транзакция будет отменена.")
+                        logger.error(
+                            f"Не удалось создать запись в 'quant_services' для person_id: {new_person_id} (msisdn: {msisdn}). Транзакция будет отменена.")
                         conn.rollback()
                         return {}
-                    logger.debug(f"Запись 'quant_services' (id: {inserted_quant_row['id']}) создана для person_id: {new_person_id}.")
+                    logger.debug(
+                        f"Запись 'quant_services' (id: {inserted_quant_row['id']}) создана для person_id: {new_person_id}.")
 
                     final_processed_ids_map[msisdn] = new_person_id
                     logger.info(f"Успешно создан абонент {msisdn} (person.id: {new_person_id}) и связанные записи.")
@@ -220,6 +277,6 @@ def create_or_update_subscribers_with_related_data( # Функция переи�
                 conn.rollback()
                 logger.info("Транзакция отменена из-за непредвиденной ошибки.")
             except Exception as roll_e:
-                logger.error(f"Ошибка при попытке отката транзакции после непредвиденной ошибки: {roll_e}", exc_info=True)
+                logger.error(f"Ошибка при попытке отката транзакции после непредвиденной ошибки: {roll_e}",
+                             exc_info=True)
         return {}
-

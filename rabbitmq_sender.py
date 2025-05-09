@@ -8,8 +8,16 @@ from config import get_settings
 TEST_CDR_EXCHANGE = "cdr-exchange"
 TEST_CDR_ROUTING_KEY = "cdr-routing-key"
 logger = logging.getLogger(__name__)
-if not logger.hasHandlers():
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+pika_loggers_to_silence = [
+    "pika.connection",
+    "pika.channel",
+    "pika.adapters.blocking_connection",
+    "pika.adapters.utils.connection_workflow",
+    "pika.adapters.utils.io_services_utils"
+]
+for logger_name in pika_loggers_to_silence:
+    logging.getLogger(logger_name).setLevel(logging.WARNING) # или logging.ERROR
 
 
 def send_cdr_list_to_rabbitmq(cdr_list: List[Dict[str, Any]]) -> bool:
